@@ -627,21 +627,14 @@ class TradingBot {
         }
 
       } catch (error) {
-        // Handle different types of errors
-        let errorMsg = 'Unknown error';
-        if (error.message) {
-          if (error.message.includes('arrow') || error.message.includes('server')) {
-            errorMsg = 'HyperSync connection issue, retrying...';
-          } else if (error.message.includes('timeout')) {
-            errorMsg = 'Request timeout, retrying...';
-          } else if (error.message.includes('network')) {
-            errorMsg = 'Network error, retrying...';
-          } else {
-            errorMsg = error.message.substring(0, 100); // Truncate long messages
-          }
+        // Log error to file without showing in UI (to keep TUI clean)
+        if (errorLog && !errorLog.destroyed) {
+          errorLog.write(`\n[${new Date().toISOString()}] TradingBot Error: ${error.message}\n`);
+          errorLog.write(`Stack: ${error.stack}\n`);
         }
         
-        this.ui.addFeedLine(`{red-fg}[ERROR]{/} ${errorMsg}`);
+        // Only show a simple, clean status in UI
+        this.ui.addFeedLine(`{yellow-fg}[NETWORK]{/} Connection interrupted, retrying...`);
         
         // Longer wait for errors to avoid spam
         await new Promise(resolve => setTimeout(resolve, 10000));
@@ -714,10 +707,11 @@ class TradingBot {
       }
 
     } catch (error) {
-      // Show errors in demo mode for debugging
-      if (this.demoMode) {
-        this.ui.addFeedLine(`  {red-fg}[DEBUG] showBackgroundSwap error: ${error.message}{/}`);
+      // Log error silently without corrupting UI
+      if (errorLog && !errorLog.destroyed) {
+        errorLog.write(`\n[${new Date().toISOString()}] showBackgroundSwap Error: ${error.message}\n`);
       }
+      // Don't show in UI to keep it clean
     }
   }
 
@@ -771,7 +765,11 @@ class TradingBot {
       }
 
     } catch (error) {
-      this.ui.addFeedLine(`{red-fg}[PARSE ERROR]{/} ${error.message}`);
+      // Log error silently without corrupting UI
+      if (errorLog && !errorLog.destroyed) {
+        errorLog.write(`\n[${new Date().toISOString()}] handleSmartWalletSwap Error: ${error.message}\n`);
+      }
+      // Don't show in UI to keep it clean
     }
   }
 
@@ -796,37 +794,38 @@ class TradingBot {
 
 // ========== Main ==========
 
-async function main() {
-  // Check for bearer token before starting TUI
-  if (!CONFIG.bearerToken) {
-    console.error("❌ ERROR: HYPERSYNC_BEARER token not found!");
-    console.error("   Please create a .env file with your HyperSync token.");
-    console.error("   Copy .env.example to .env and add your token.");
-    console.error("   Get one at: https://envio.dev\n");
-    process.exit(1);
-  }
-  
-  // COMPLETELY suppress ALL output to prevent TUI corruption
-  // This includes stderr from HyperSync client's Rust layer
-  let debugLog = null;
-  let errorLog = null;
+// Global variables for logging and cleanup
+let debugLog = null;
+let errorLog = null;
+let originalStderrWrite = null;
+let originalConsoleError = console.error;
+let originalConsoleWarn = console.warn;
+let originalConsoleLog = console.log;
+
+// Setup output suppression BEFORE any other initialization
+function setupOutputSuppression() {
+  // Create error log to capture stderr (HyperSync Rust errors)
+  errorLog = fs.createWriteStream('hypersync_errors.log', { flags: 'a' });
+  errorLog.write(`\n\n=== Session started at ${new Date().toISOString()} ===\n`);
   
   if (CONFIG.enableDebugLog) {
     debugLog = fs.createWriteStream('debug.log', { flags: 'a' });
     debugLog.write(`\n\n=== Session started at ${new Date().toISOString()} ===\n`);
   }
   
-  // Always create error log to capture stderr (HyperSync Rust errors)
-  errorLog = fs.createWriteStream('hypersync_errors.log', { flags: 'a' });
-  errorLog.write(`\n\n=== Session started at ${new Date().toISOString()} ===\n`);
-  
-  // Redirect stderr to file to prevent Rust layer logs from corrupting TUI
-  const originalStderrWrite = process.stderr.write.bind(process.stderr);
+  // Redirect stderr to file IMMEDIATELY to prevent Rust layer logs from corrupting TUI
+  originalStderrWrite = process.stderr.write.bind(process.stderr);
   process.stderr.write = (chunk, encoding, callback) => {
     // Write to error log file instead of terminal
-    if (errorLog) {
-      errorLog.write(chunk, encoding, callback);
+    try {
+      if (errorLog && !errorLog.destroyed) {
+        errorLog.write(chunk, encoding, callback);
+      }
+    } catch (e) {
+      // Ignore write errors
     }
+    
+    // Handle callback
     if (typeof encoding === 'function') {
       encoding();
     } else if (typeof callback === 'function') {
@@ -837,33 +836,88 @@ async function main() {
   
   // Override console methods to prevent TUI corruption
   console.error = (...args) => {
-    if (CONFIG.enableDebugLog && debugLog) {
+    if (debugLog && !debugLog.destroyed) {
       debugLog.write(`[${new Date().toISOString()}] ERROR: ${JSON.stringify(args)}\n`);
     }
-    if (errorLog) {
+    if (errorLog && !errorLog.destroyed) {
       errorLog.write(`[${new Date().toISOString()}] ERROR: ${args.join(' ')}\n`);
     }
     // Suppress all console output
   };
   
   console.warn = (...args) => {
-    if (CONFIG.enableDebugLog && debugLog) {
+    if (debugLog && !debugLog.destroyed) {
       debugLog.write(`[${new Date().toISOString()}] WARN: ${JSON.stringify(args)}\n`);
     }
-    if (errorLog) {
+    if (errorLog && !errorLog.destroyed) {
       errorLog.write(`[${new Date().toISOString()}] WARN: ${args.join(' ')}\n`);
     }
     // Suppress all console output
   };
   
   console.log = (...args) => {
-    if (CONFIG.enableDebugLog && debugLog) {
+    if (debugLog && !debugLog.destroyed) {
       debugLog.write(`[${new Date().toISOString()}] LOG: ${JSON.stringify(args)}\n`);
     }
     // Suppress all console output
   };
+}
 
-  // Initialize components
+// Cleanup function to restore outputs
+function cleanup() {
+  try {
+    if (originalStderrWrite) {
+      process.stderr.write = originalStderrWrite;
+    }
+    console.error = originalConsoleError;
+    console.warn = originalConsoleWarn;
+    console.log = originalConsoleLog;
+    
+    if (debugLog && !debugLog.destroyed) debugLog.end();
+    if (errorLog && !errorLog.destroyed) errorLog.end();
+  } catch (e) {
+    // Ignore cleanup errors
+  }
+}
+
+async function main() {
+  // Check for bearer token before starting TUI
+  if (!CONFIG.bearerToken) {
+    console.error("❌ ERROR: HYPERSYNC_BEARER token not found!");
+    console.error("   Please create a .env file with your HyperSync token.");
+    console.error("   Copy .env.example to .env and add your token.");
+    console.error("   Get one at: https://envio.dev\n");
+    process.exit(1);
+  }
+  
+  // Setup output suppression BEFORE creating any components
+  setupOutputSuppression();
+  
+  // Register cleanup handlers
+  process.on('exit', cleanup);
+  process.on('SIGINT', () => {
+    cleanup();
+    process.exit(0);
+  });
+  process.on('SIGTERM', () => {
+    cleanup();
+    process.exit(0);
+  });
+  process.on('uncaughtException', (err) => {
+    if (errorLog && !errorLog.destroyed) {
+      errorLog.write(`\n[UNCAUGHT EXCEPTION] ${err.stack}\n`);
+    }
+    cleanup();
+    // Restore stderr for final error message
+    if (originalStderrWrite) {
+      process.stderr.write = originalStderrWrite;
+    }
+    process.stderr.write('\n\n❌ Uncaught Exception: ' + err.message + '\n');
+    process.stderr.write(err.stack + '\n');
+    process.exit(1);
+  });
+
+  // Initialize components AFTER output suppression
   const client = HypersyncClient.new({
     url: CONFIG.hypersyncUrl,
     bearerToken: CONFIG.bearerToken,
@@ -873,25 +927,16 @@ async function main() {
   const ui = new TUIManager();
   const bot = new TradingBot(client, account, ui);
 
-  // Cleanup function to restore stderr on exit
-  const cleanup = () => {
-    process.stderr.write = originalStderrWrite;
-    if (debugLog) debugLog.end();
-    if (errorLog) errorLog.end();
-  };
-  
-  process.on('exit', cleanup);
-  process.on('SIGINT', () => {
-    cleanup();
-    process.exit(0);
-  });
-
   // Start the bot
   await bot.start();
 }
 
 main().catch(error => {
-  // Restore console and display fatal error
+  cleanup();
+  // Restore stderr for fatal error display
+  if (originalStderrWrite) {
+    process.stderr.write = originalStderrWrite;
+  }
   process.stderr.write('\n\n❌ Fatal Error: ' + error.message + '\n');
   process.stderr.write(error.stack + '\n');
   process.exit(1);
