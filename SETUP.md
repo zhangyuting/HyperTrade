@@ -107,7 +107,8 @@ HyperTrade/
 The following files are automatically ignored by git:
 - `.env` - Environment variables with secrets
 - `account_state.json` - Trading account state
-- `debug.log` - Debug output logs
+- `debug.log` - Debug output logs (when enableDebugLog is true)
+- `hypersync_errors.log` - HyperSync client errors and stderr logs
 - `.DS_Store` - macOS system files
 
 ## npm Scripts Available

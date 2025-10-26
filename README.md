@@ -281,6 +281,8 @@ Enable detailed logging for troubleshooting:
 enableDebugLog: true,     // Writes to debug.log
 ```
 
+> **Note**: HyperSync client errors are automatically logged to `hypersync_errors.log` to prevent TUI corruption. Check this file if you encounter connection issues.
+
 ## 🎯 Use Cases
 
 This project demonstrates HyperSync's potential for:

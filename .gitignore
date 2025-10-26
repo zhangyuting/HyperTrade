@@ -11,6 +11,7 @@ DS_Store
 # Account state and logs
 account_state.json
 debug.log
+hypersync_errors.log
 
 # IDE
 .vscode/

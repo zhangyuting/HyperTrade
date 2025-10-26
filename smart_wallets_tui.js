@@ -806,19 +806,42 @@ async function main() {
     process.exit(1);
   }
   
-  // COMPLETELY suppress ALL console output to prevent TUI corruption
+  // COMPLETELY suppress ALL output to prevent TUI corruption
+  // This includes stderr from HyperSync client's Rust layer
   let debugLog = null;
+  let errorLog = null;
   
   if (CONFIG.enableDebugLog) {
-    const fs = await import('fs');
     debugLog = fs.createWriteStream('debug.log', { flags: 'a' });
     debugLog.write(`\n\n=== Session started at ${new Date().toISOString()} ===\n`);
   }
   
+  // Always create error log to capture stderr (HyperSync Rust errors)
+  errorLog = fs.createWriteStream('hypersync_errors.log', { flags: 'a' });
+  errorLog.write(`\n\n=== Session started at ${new Date().toISOString()} ===\n`);
+  
+  // Redirect stderr to file to prevent Rust layer logs from corrupting TUI
+  const originalStderrWrite = process.stderr.write.bind(process.stderr);
+  process.stderr.write = (chunk, encoding, callback) => {
+    // Write to error log file instead of terminal
+    if (errorLog) {
+      errorLog.write(chunk, encoding, callback);
+    }
+    if (typeof encoding === 'function') {
+      encoding();
+    } else if (typeof callback === 'function') {
+      callback();
+    }
+    return true;
+  };
+  
   // Override console methods to prevent TUI corruption
   console.error = (...args) => {
-    if (CONFIG.enableDebugLog && debugLog && args[0]?.includes?.('[DEBUG]')) {
+    if (CONFIG.enableDebugLog && debugLog) {
       debugLog.write(`[${new Date().toISOString()}] ERROR: ${JSON.stringify(args)}\n`);
+    }
+    if (errorLog) {
+      errorLog.write(`[${new Date().toISOString()}] ERROR: ${args.join(' ')}\n`);
     }
     // Suppress all console output
   };
@@ -827,11 +850,14 @@ async function main() {
     if (CONFIG.enableDebugLog && debugLog) {
       debugLog.write(`[${new Date().toISOString()}] WARN: ${JSON.stringify(args)}\n`);
     }
+    if (errorLog) {
+      errorLog.write(`[${new Date().toISOString()}] WARN: ${args.join(' ')}\n`);
+    }
     // Suppress all console output
   };
   
   console.log = (...args) => {
-    if (CONFIG.enableDebugLog && debugLog && args[0]?.includes?.('[DEBUG]')) {
+    if (CONFIG.enableDebugLog && debugLog) {
       debugLog.write(`[${new Date().toISOString()}] LOG: ${JSON.stringify(args)}\n`);
     }
     // Suppress all console output
@@ -846,6 +872,19 @@ async function main() {
   const account = new AccountManager(CONFIG.initialBalance);
   const ui = new TUIManager();
   const bot = new TradingBot(client, account, ui);
+
+  // Cleanup function to restore stderr on exit
+  const cleanup = () => {
+    process.stderr.write = originalStderrWrite;
+    if (debugLog) debugLog.end();
+    if (errorLog) errorLog.end();
+  };
+  
+  process.on('exit', cleanup);
+  process.on('SIGINT', () => {
+    cleanup();
+    process.exit(0);
+  });
 
   // Start the bot
   await bot.start();
