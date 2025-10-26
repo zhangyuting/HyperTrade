@@ -1,10 +1,19 @@
 /**
  * Smart Wallet Copy Trading - TUI Version
  * Real-time monitoring and auto-trading with beautiful terminal interface
+ * 
+ * This application monitors blockchain transactions in real-time using HyperSync,
+ * detects trades from profitable "smart wallets", and automatically copies them.
+ * 
+ * Features:
+ * - Real-time blockchain monitoring with <1s latency
+ * - Beautiful terminal UI with live updates
+ * - Automatic trade execution and position management
+ * - Two modes: Smart-Wallet (production) and Demo (testing)
  */
 
-import 'dotenv/config';
-import blessed from 'blessed';
+import 'dotenv/config';  // Load environment variables from .env file
+import blessed from 'blessed';  // Terminal UI library
 import {
   HypersyncClient,
   LogField,
@@ -12,68 +21,100 @@ import {
   TransactionField,
   JoinMode,
   Decoder,
-} from "@envio-dev/hypersync-client";
-import { keccak256, toUtf8Bytes } from "ethers";
-import fs from 'fs';
+} from "@envio-dev/hypersync-client";  // Ultra-fast blockchain data streaming
+import { keccak256, toUtf8Bytes } from "ethers";  // Crypto utilities
+import fs from 'fs';  // File system for logs and state persistence
 
 // ========== Configuration ==========
 
 const CONFIG = {
+  // HyperSync API settings (loaded from .env file)
   hypersyncUrl: process.env.HYPERSYNC_URL || "https://eth.hypersync.xyz",
-  bearerToken: process.env.HYPERSYNC_BEARER,
+  bearerToken: process.env.HYPERSYNC_BEARER,  // Required: Get from envio.dev
   
+  // Uniswap V3 pools to monitor
   pools: [
     "0x8ad599c3a0ff1de082011efddc58f1908eb6e6d8", // Uniswap V3 USDC/WETH 0.3%
   ],
   
+  // Token decimals for each pool (needed for price calculation)
   poolDecimals: {
     "0x8ad599c3a0ff1de082011efddc58f1908eb6e6d8": { 
-      token0: 6,   // USDC
-      token1: 18,  // WETH
+      token0: 6,   // USDC has 6 decimals
+      token1: 18,  // WETH has 18 decimals
     },
   },
   
+  // "Smart wallets" to follow - addresses known for profitable trading
+  // Add more addresses to follow multiple traders
   smartWallets: [
     "0x56fc0708725a65ebb633efdaec931c0600a9face",
-  ].map(addr => addr.toLowerCase()),
+  ].map(addr => addr.toLowerCase()),  // Normalize to lowercase
   
-  // Trading strategy
-  minTradeSize: 0.1,        // Minimum 0.1 ETH to follow
-  holdDuration: 120,         // Hold for 120 seconds
-  startBlocksBack: 5000,     // Scan last 5000 blocks
+  // Trading strategy parameters
+  minTradeSize: 0.1,        // Minimum 0.1 ETH to follow (ignore smaller trades)
+  holdDuration: 120,         // Hold position for 120 seconds before closing
+  startBlocksBack: 5000,     // How many historical blocks to scan on startup
   
-  // Account settings
-  initialBalance: 10000,     // $10,000 starting balance
-  riskPerTrade: 0.02,        // 2% risk per trade
+  // Account settings (simulated trading)
+  initialBalance: 10000,     // Start with $10,000 virtual balance
+  riskPerTrade: 0.02,        // Risk 2% per trade (for future risk management)
   
   // Debug settings
-  enableDebugLog: false,     // Set to true to write debug logs to debug.log
+  enableDebugLog: false,     // Set to true to write verbose logs to debug.log
 };
 
 // ========== Event Setup ==========
 
+// Uniswap V3 Swap event signature
 const SWAP_SIGNATURE = "Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick)";
+// Pre-compute the topic0 hash for efficient filtering
 const SWAP_TOPIC0 = keccak256(toUtf8Bytes("Swap(address,address,int256,int256,uint160,uint128,int24)")).toLowerCase();
+// Create decoder to parse event logs
 const decoder = Decoder.fromSignatures([SWAP_SIGNATURE]);
 
 // ========== Helper Functions ==========
 
+/**
+ * Calculate USD price per ETH from Uniswap V3's sqrtPriceX96
+ * @param {BigInt} sqrtPriceX96 - Square root of price * 2^96 (Uniswap V3 format)
+ * @param {number} decimals0 - Token0 decimals (USDC = 6)
+ * @param {number} decimals1 - Token1 decimals (WETH = 18)
+ * @returns {number} Price in USDC per ETH
+ */
 function calculatePrice(sqrtPriceX96, decimals0 = 6, decimals1 = 18) {
-  const Q192 = 2n ** 192n;
+  const Q192 = 2n ** 192n;  // Q192 constant from Uniswap V3
+  // Calculate price token1/token0
   const priceToken1PerToken0 = Number((sqrtPriceX96 * sqrtPriceX96 * BigInt(10 ** decimals0)) / Q192) / (10 ** decimals1);
+  // Invert to get USDC per ETH
   return 1 / priceToken1PerToken0;
 }
 
+/**
+ * Convert BigInt amount to decimal float
+ * @param {BigInt} bigIntValue - Raw token amount
+ * @param {number} decimals - Token decimals
+ * @returns {number} Formatted decimal amount
+ */
 function formatAmount(bigIntValue, decimals) {
   const absValue = bigIntValue < 0n ? -bigIntValue : bigIntValue;
   const valueStr = absValue.toString().padStart(decimals + 1, '0');
   return parseFloat(valueStr.slice(0, -decimals) + '.' + valueStr.slice(-decimals));
 }
 
+/**
+ * Get current time as formatted string
+ * @returns {string} Localized time string
+ */
 function formatTime() {
   return new Date().toLocaleTimeString();
 }
 
+/**
+ * Format PnL percentage with color
+ * @param {number} pnl - PnL percentage
+ * @returns {string} Colored string for blessed UI
+ */
 function formatPnL(pnl) {
   const sign = pnl >= 0 ? '+' : '';
   const color = pnl >= 0 ? '{green-fg}' : '{red-fg}';
@@ -82,15 +123,27 @@ function formatPnL(pnl) {
 
 // ========== Account Manager ==========
 
+/**
+ * Manages trading account state including balance, positions, and trade history
+ * Persists state to disk to survive restarts
+ */
 class AccountManager {
+  /**
+   * Initialize account with starting balance
+   * @param {number} initialBalance - Starting USD balance
+   */
   constructor(initialBalance) {
     this.balance = initialBalance;
     this.initialBalance = initialBalance;
-    this.trades = [];
-    this.currentPosition = null;
-    this.loadState();
+    this.trades = [];  // Complete trade history
+    this.currentPosition = null;  // Active position (only one at a time)
+    this.loadState();  // Load previous state if exists
   }
 
+  /**
+   * Load saved account state from disk
+   * Allows bot to resume after restart without losing trade history
+   */
   loadState() {
     try {
       if (fs.existsSync('account_state.json')) {
@@ -99,10 +152,14 @@ class AccountManager {
         this.trades = state.trades || [];
       }
     } catch (e) {
-      // Ignore load errors
+      // Ignore load errors - start fresh if file is corrupted
     }
   }
 
+  /**
+   * Save current account state to disk
+   * Persists after each trade for data safety
+   */
   saveState() {
     try {
       fs.writeFileSync('account_state.json', JSON.stringify({
@@ -110,13 +167,21 @@ class AccountManager {
         trades: this.trades,
       }, null, 2));
     } catch (e) {
-      // Ignore save errors
+      // Ignore save errors - not critical
     }
   }
 
+  /**
+   * Open a new trading position
+   * @param {string} side - "BUY" or "SELL"
+   * @param {number} ethAmount - Amount of ETH in the trade
+   * @param {number} usdcAmount - Amount of USDC in the trade
+   * @param {number} price - Entry price (USDC per ETH)
+   * @returns {Object} The opened position
+   */
   openPosition(side, ethAmount, usdcAmount, price) {
     const usdValue = usdcAmount;
-    // Normalize side immediately when opening position
+    // Normalize side immediately when opening position to avoid comparison issues
     const normalizedSide = side.trim().toUpperCase();
     
     if (CONFIG.enableDebugLog) {
@@ -128,7 +193,7 @@ class AccountManager {
     }
     
     this.currentPosition = {
-      side: normalizedSide,  // Store normalized side
+      side: normalizedSide,  // "BUY" or "SELL" (normalized)
       ethAmount,
       usdcAmount,
       entryPrice: price,
@@ -138,6 +203,11 @@ class AccountManager {
     return this.currentPosition;
   }
 
+  /**
+   * Close the current position and calculate PnL
+   * @param {number} exitPrice - Exit price (USDC per ETH)
+   * @returns {Object|null} The closed trade with PnL, or null if no position
+   */
   closePosition(exitPrice) {
     if (!this.currentPosition) return null;
 
@@ -158,14 +228,16 @@ class AccountManager {
       });
     }
     
-    // Calculate PnL
+    // Calculate PnL based on position side
     let pnl;
     if (side === 'BUY') {
+      // For BUY: profit when price goes up
       pnl = (exitPrice - this.currentPosition.entryPrice) / this.currentPosition.entryPrice;
       if (CONFIG.enableDebugLog) {
         console.log(`[DEBUG] Using BUY formula: (${exitPrice} - ${this.currentPosition.entryPrice}) / ${this.currentPosition.entryPrice} = ${pnl}`);
       }
     } else {
+      // For SELL: profit when price goes down
       pnl = (this.currentPosition.entryPrice - exitPrice) / this.currentPosition.entryPrice;
       if (CONFIG.enableDebugLog) {
         console.log(`[DEBUG] Using SELL formula: (${this.currentPosition.entryPrice} - ${exitPrice}) / ${this.currentPosition.entryPrice} = ${pnl}`);
@@ -182,8 +254,10 @@ class AccountManager {
       });
     }
     
+    // Update balance
     this.balance += pnlUsd;
 
+    // Create trade record
     const trade = {
       id: this.trades.length + 1,
       ...this.currentPosition,
@@ -197,11 +271,15 @@ class AccountManager {
 
     this.trades.push(trade);
     this.currentPosition = null;
-    this.saveState();
+    this.saveState();  // Persist state after closing position
 
     return trade;
   }
 
+  /**
+   * Get account statistics and recent trade history
+   * @returns {Object} Stats including balance, win rate, and recent trades
+   */
   getStats() {
     const totalTrades = this.trades.length;
     const winningTrades = this.trades.filter(t => t.pnl > 0).length;
@@ -214,24 +292,38 @@ class AccountManager {
       winRate: totalTrades > 0 ? (winningTrades / totalTrades * 100) : 0,
       totalPnlUsd,
       totalPnlPercent,
-      recentTrades: this.trades.slice(-10).reverse(),
+      recentTrades: this.trades.slice(-10).reverse(),  // Last 10 trades, newest first
     };
   }
 }
 
 // ========== TUI Manager ==========
 
+/**
+ * Manages the terminal user interface using blessed library
+ * Creates and updates three main panels: Live Feed, Current Position, and Account Summary
+ */
 class TUIManager {
+  /**
+   * Initialize the TUI with blessed screen
+   */
   constructor() {
     this.screen = blessed.screen({
-      smartCSR: true,
+      smartCSR: true,  // Smart cursor positioning for better performance
       title: 'Smart Wallet Copy Trading'
     });
 
-    this.createLayout();
-    this.setupHandlers();
+    this.createLayout();  // Create UI panels
+    this.setupHandlers();  // Setup keyboard handlers
   }
 
+  /**
+   * Create the three-panel layout:
+   * - Header: Status bar with balance and block info
+   * - Left: Live feed of blockchain events
+   * - Right Top: Current position details
+   * - Right Bottom: Account summary and trade history
+   */
   createLayout() {
     // Header
     this.header = blessed.box({
@@ -447,18 +539,28 @@ class TUIManager {
 
 // ========== Main Trading Bot ==========
 
+/**
+ * Core trading bot that monitors blockchain, detects smart wallet trades, and executes copies
+ * Uses HyperSync for real-time, high-speed blockchain data streaming
+ */
 class TradingBot {
+  /**
+   * Initialize the trading bot
+   * @param {HypersyncClient} client - HyperSync client for blockchain data
+   * @param {AccountManager} account - Account manager for positions and balance
+   * @param {TUIManager} ui - Terminal UI manager for display
+   */
   constructor(client, account, ui) {
     this.client = client;
     this.account = account;
     this.ui = ui;
     this.currentBlock = 0;
-    this.lastPrice = null;
+    this.lastPrice = null;  // Track last known price for position updates
     
-    // Demo mode: follow all BUY trades, not just smart wallets
+    // Demo mode: follow all BUY trades, not just smart wallets (for testing)
     this.demoMode = false;
     
-    // Statistics for live feed
+    // Statistics for live feed display
     this.stats = {
       totalBlocks: 0,
       totalSwaps: 0,
@@ -467,10 +569,15 @@ class TradingBot {
       lastBlockTime: Date.now(),
     };
     
-    // Setup mode toggle handler
+    // Setup mode toggle handler (press 'd' key)
     this.ui.onModeToggle = () => this.toggleMode();
   }
   
+  /**
+   * Toggle between SMART-WALLET mode and DEMO mode
+   * SMART-WALLET: Only follow configured smart wallet addresses
+   * DEMO: Follow ALL buy trades above threshold (for testing/demo)
+   */
   toggleMode() {
     this.demoMode = !this.demoMode;
     const modeName = this.demoMode ? 'DEMO' : 'SMART-WALLET';
@@ -482,6 +589,12 @@ class TradingBot {
     this.ui.addFeedLine(``);
   }
 
+  /**
+   * Main bot loop - continuously stream and process blockchain data
+   * This is where HyperSync's speed advantage shines:
+   * - Historical sync: Processes thousands of blocks per second
+   * - Live monitoring: <1 second latency from block finality to detection
+   */
   async start() {
     const currentHeight = await this.client.getHeight();
     let fromBlock = currentHeight - CONFIG.startBlocksBack;
@@ -642,8 +755,15 @@ class TradingBot {
     }
   }
 
+  /**
+   * Process and display regular swaps (not from smart wallets)
+   * In Demo mode, can auto-follow BUY trades for testing
+   * @param {Object} log - Raw event log from blockchain
+   * @param {Object} transaction - Transaction details
+   */
   async showBackgroundSwap(log, transaction) {
     try {
+      // Decode the Uniswap V3 Swap event
       const decodedLogs = await decoder.decodeLogs([log]);
       if (!decodedLogs || !decodedLogs[0]) {
         if (this.demoMode) {
@@ -653,31 +773,31 @@ class TradingBot {
       }
 
       const decoded = decodedLogs[0];
-      const amount0 = decoded.body[0]?.val || 0n;
-      const amount1 = decoded.body[1]?.val || 0n;
-      const sqrtPriceX96 = decoded.body[2]?.val || 0n;
+      const amount0 = decoded.body[0]?.val || 0n;  // USDC amount
+      const amount1 = decoded.body[1]?.val || 0n;  // WETH amount
+      const sqrtPriceX96 = decoded.body[2]?.val || 0n;  // Price in Uniswap V3 format
 
       const pool = log.address?.toLowerCase();
       const decimals = CONFIG.poolDecimals[pool] || { token0: 6, token1: 18 };
 
-      // Use absolute value for display
+      // Convert BigInt amounts to human-readable decimals
       const amount0USDC = formatAmount(amount0 < 0n ? -amount0 : amount0, decimals.token0);
       const amount1ETH = formatAmount(amount1 < 0n ? -amount1 : amount1, decimals.token1);
       const price = calculatePrice(sqrtPriceX96, decimals.token0, decimals.token1);
       
-      // Update last known price
+      // Update last known price for position tracking
       this.lastPrice = price;
 
-      // Uniswap V3 amounts are from pool's perspective:
-      // amount1 < 0 means pool pays out WETH (user buys WETH)
-      // amount1 > 0 means pool receives WETH (user sells WETH)
+      // Determine trade direction from pool's perspective:
+      // amount1 < 0: pool pays out WETH → user buys ETH
+      // amount1 > 0: pool receives WETH → user sells ETH
       const isBuyingETH = amount1 < 0n;
       const side = isBuyingETH ? "BUY" : "SELL";
       const from = transaction?.from?.slice(0, 10);
 
-      // Show trades based on mode
-      const showThreshold = this.demoMode ? 0.005 : 0.5; // Even lower threshold in demo mode
-      const followThreshold = this.demoMode ? 0.005 : CONFIG.minTradeSize; // Same as show threshold in demo
+      // Adjust thresholds based on mode
+      const showThreshold = this.demoMode ? 0.005 : 0.5;  // Lower in demo for more visibility
+      const followThreshold = this.demoMode ? 0.005 : CONFIG.minTradeSize;
       
       // Debug: show all detected swaps in demo mode
       if (this.demoMode && amount1ETH < showThreshold) {
@@ -715,32 +835,39 @@ class TradingBot {
     }
   }
 
+  /**
+   * Handle swap from a smart wallet - this is our signal to copy trade!
+   * Automatically opens a position following the smart wallet's trade
+   * @param {Object} log - Raw event log from blockchain
+   * @param {Object} transaction - Transaction details
+   */
   async handleSmartWalletSwap(log, transaction) {
     try {
+      // Decode the swap event
       const decodedLogs = await decoder.decodeLogs([log]);
       if (!decodedLogs || !decodedLogs[0]) return;
 
       const decoded = decodedLogs[0];
-      const amount0 = decoded.body[0]?.val || 0n;
-      const amount1 = decoded.body[1]?.val || 0n;
-      const sqrtPriceX96 = decoded.body[2]?.val || 0n;
+      const amount0 = decoded.body[0]?.val || 0n;  // USDC
+      const amount1 = decoded.body[1]?.val || 0n;  // WETH
+      const sqrtPriceX96 = decoded.body[2]?.val || 0n;  // Price
 
       const pool = log.address?.toLowerCase();
       const decimals = CONFIG.poolDecimals[pool] || { token0: 6, token1: 18 };
 
-      // Use absolute value for display
+      // Convert to human-readable amounts
       const amount0USDC = formatAmount(amount0 < 0n ? -amount0 : amount0, decimals.token0);
       const amount1ETH = formatAmount(amount1 < 0n ? -amount1 : amount1, decimals.token1);
       const price = calculatePrice(sqrtPriceX96, decimals.token0, decimals.token1);
       this.lastPrice = price;
 
-      // Uniswap V3 amounts are from pool's perspective:
-      // amount1 < 0 means pool pays out WETH (user buys WETH)
-      // amount1 > 0 means pool receives WETH (user sells WETH)
+      // Determine trade direction
+      // amount1 < 0: pool pays out WETH → smart wallet buys ETH
+      // amount1 > 0: pool receives WETH → smart wallet sells ETH
       const isBuyingETH = amount1 < 0n;
       const side = isBuyingETH ? "BUY" : "SELL";
 
-      // Check if trade size meets minimum
+      // Check if trade size meets minimum threshold
       if (amount1ETH < CONFIG.minTradeSize) {
         this.ui.addFeedLine(`{yellow-fg}[TARGET]{/} Wallet detected but size too small ({cyan-fg}${amount1ETH.toFixed(4)} ETH{/})`);
         return;
@@ -749,23 +876,25 @@ class TradingBot {
       const from = transaction?.from?.slice(0, 12);
       const txHash = transaction?.hash?.slice(0, 10);
       
+      // Alert user about smart wallet activity
       this.ui.addFeedLine(``);
       this.ui.addFeedLine(`{bold}{yellow-fg}>>> TARGET WALLET DETECTED (Real-time via HyperSync) <<<{/}{/}`);
       this.ui.addFeedLine(`  Wallet: {cyan-fg}${from}...{/} | Tx: {gray-fg}${txHash}...{/}`);
       this.ui.addFeedLine(`  Action: {yellow-fg}${side}{/} {cyan-fg}${amount1ETH.toFixed(4)} ETH{/} @ {white-fg}$${price.toFixed(2)}{/}`);
       this.ui.addFeedLine(`  Value:  {white-fg}$${(amount1ETH * price).toFixed(2)}{/}`);
 
-      // Auto-follow the trade
+      // Auto-follow the trade (copy it)
       if (!this.account.currentPosition) {
         this.account.openPosition(side, amount1ETH, amount0USDC, price);
         this.ui.addFeedLine(`  {green-fg}[AUTO-FOLLOW] Position opened instantly!{/}`);
         this.ui.updatePosition(this.account.currentPosition, price);
       } else {
+        // Already in a position, skip this trade
         this.ui.addFeedLine(`  {yellow-fg}[SKIP] Already in position{/}`);
       }
 
     } catch (error) {
-      // Log error silently without corrupting UI
+      // Log error silently to avoid corrupting TUI
       if (errorLog && !errorLog.destroyed) {
         errorLog.write(`\n[${new Date().toISOString()}] handleSmartWalletSwap Error: ${error.message}\n`);
       }
@@ -773,6 +902,10 @@ class TradingBot {
     }
   }
 
+  /**
+   * Close the current position and display results
+   * @param {number} exitPrice - Price at which to close the position
+   */
   closePosition(exitPrice) {
     const trade = this.account.closePosition(exitPrice);
     if (trade) {
@@ -780,6 +913,7 @@ class TradingBot {
       const pnlSign = trade.pnl >= 0 ? '+' : '';
       const result = trade.pnl >= 0 ? '[WIN]' : '[LOSS]';
       
+      // Display trade results in UI
       this.ui.addFeedLine(``);
       this.ui.addFeedLine(`{bold}{${pnlColor}}>>> POSITION CLOSED ${result} <<<{/}{/}`);
       this.ui.addFeedLine(`  Entry:  $${trade.entryPrice.toFixed(2)} | Exit: $${exitPrice.toFixed(2)}`);
@@ -795,25 +929,36 @@ class TradingBot {
 // ========== Main ==========
 
 // Global variables for logging and cleanup
-let debugLog = null;
-let errorLog = null;
-let originalStderrWrite = null;
-let originalConsoleError = console.error;
+// These must be global to persist across the application lifetime
+let debugLog = null;  // Optional debug log (only if CONFIG.enableDebugLog = true)
+let errorLog = null;  // Error log for HyperSync Rust layer errors
+let originalStderrWrite = null;  // Original stderr.write to restore on exit
+let originalConsoleError = console.error;  // Original console methods
 let originalConsoleWarn = console.warn;
 let originalConsoleLog = console.log;
 
-// Setup output suppression BEFORE any other initialization
+/**
+ * Setup output suppression to prevent TUI corruption
+ * Must be called BEFORE creating the blessed screen
+ * 
+ * Problem: HyperSync client (Rust layer) writes errors directly to stderr,
+ * bypassing JavaScript's console methods. This corrupts the TUI display.
+ * 
+ * Solution: Redirect all stderr and console output to log files instead
+ */
 function setupOutputSuppression() {
-  // Create error log to capture stderr (HyperSync Rust errors)
+  // Create error log to capture all errors (especially from Rust layer)
   errorLog = fs.createWriteStream('hypersync_errors.log', { flags: 'a' });
   errorLog.write(`\n\n=== Session started at ${new Date().toISOString()} ===\n`);
   
+  // Create optional debug log if enabled
   if (CONFIG.enableDebugLog) {
     debugLog = fs.createWriteStream('debug.log', { flags: 'a' });
     debugLog.write(`\n\n=== Session started at ${new Date().toISOString()} ===\n`);
   }
   
-  // Redirect stderr to file IMMEDIATELY to prevent Rust layer logs from corrupting TUI
+  // Redirect stderr to file to prevent Rust layer logs from corrupting TUI
+  // This is the critical fix for HyperSync error messages appearing in terminal
   originalStderrWrite = process.stderr.write.bind(process.stderr);
   process.stderr.write = (chunk, encoding, callback) => {
     // Write to error log file instead of terminal
@@ -822,10 +967,10 @@ function setupOutputSuppression() {
         errorLog.write(chunk, encoding, callback);
       }
     } catch (e) {
-      // Ignore write errors
+      // Ignore write errors to avoid infinite loops
     }
     
-    // Handle callback
+    // Handle callback properly
     if (typeof encoding === 'function') {
       encoding();
     } else if (typeof callback === 'function') {
@@ -842,7 +987,7 @@ function setupOutputSuppression() {
     if (errorLog && !errorLog.destroyed) {
       errorLog.write(`[${new Date().toISOString()}] ERROR: ${args.join(' ')}\n`);
     }
-    // Suppress all console output
+    // Suppress all console output (don't write to terminal)
   };
   
   console.warn = (...args) => {
@@ -863,9 +1008,13 @@ function setupOutputSuppression() {
   };
 }
 
-// Cleanup function to restore outputs
+/**
+ * Cleanup function to restore outputs and close log files
+ * Called on exit to ensure clean shutdown
+ */
 function cleanup() {
   try {
+    // Restore original stderr and console methods
     if (originalStderrWrite) {
       process.stderr.write = originalStderrWrite;
     }
@@ -873,15 +1022,20 @@ function cleanup() {
     console.warn = originalConsoleWarn;
     console.log = originalConsoleLog;
     
+    // Close log file streams
     if (debugLog && !debugLog.destroyed) debugLog.end();
     if (errorLog && !errorLog.destroyed) errorLog.end();
   } catch (e) {
-    // Ignore cleanup errors
+    // Ignore cleanup errors - we're exiting anyway
   }
 }
 
+/**
+ * Main application entry point
+ * Initializes HyperSync client, account manager, TUI, and trading bot
+ */
 async function main() {
-  // Check for bearer token before starting TUI
+  // Validate environment: Check for HyperSync bearer token before starting
   if (!CONFIG.bearerToken) {
     console.error("❌ ERROR: HYPERSYNC_BEARER token not found!");
     console.error("   Please create a .env file with your HyperSync token.");
@@ -891,19 +1045,23 @@ async function main() {
   }
   
   // Setup output suppression BEFORE creating any components
+  // This prevents HyperSync Rust errors from corrupting the TUI
   setupOutputSuppression();
   
-  // Register cleanup handlers
+  // Register cleanup handlers for graceful shutdown
   process.on('exit', cleanup);
   process.on('SIGINT', () => {
+    // Ctrl+C pressed
     cleanup();
     process.exit(0);
   });
   process.on('SIGTERM', () => {
+    // Kill signal received
     cleanup();
     process.exit(0);
   });
   process.on('uncaughtException', (err) => {
+    // Unexpected error - log and exit gracefully
     if (errorLog && !errorLog.destroyed) {
       errorLog.write(`\n[UNCAUGHT EXCEPTION] ${err.stack}\n`);
     }
@@ -917,26 +1075,37 @@ async function main() {
     process.exit(1);
   });
 
-  // Initialize components AFTER output suppression
+  // Initialize components AFTER output suppression is in place
+  
+  // 1. HyperSync client - connects to ultra-fast blockchain data stream
   const client = HypersyncClient.new({
     url: CONFIG.hypersyncUrl,
     bearerToken: CONFIG.bearerToken,
   });
 
+  // 2. Account manager - tracks balance and positions
   const account = new AccountManager(CONFIG.initialBalance);
+  
+  // 3. TUI manager - creates the beautiful terminal interface
   const ui = new TUIManager();
+  
+  // 4. Trading bot - core logic that ties everything together
   const bot = new TradingBot(client, account, ui);
 
-  // Start the bot
+  // Start the bot - this runs indefinitely until interrupted
   await bot.start();
 }
 
+// Application entry point with error handling
 main().catch(error => {
+  // Fatal error occurred - clean up and display error
   cleanup();
+  
   // Restore stderr for fatal error display
   if (originalStderrWrite) {
     process.stderr.write = originalStderrWrite;
   }
+  
   process.stderr.write('\n\n❌ Fatal Error: ' + error.message + '\n');
   process.stderr.write(error.stack + '\n');
   process.exit(1);
