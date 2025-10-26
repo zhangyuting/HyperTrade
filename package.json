@@ -1,0 +1,30 @@
+{
+  "name": "hypertrade",
+  "version": "1.0.0",
+  "description": "Real-time smart wallet copy trading powered by Envio HyperSync",
+  "main": "smart_wallets_tui.js",
+  "scripts": {
+    "start": "node smart_wallets_tui.js",
+    "simple": "node smart_wallets.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "hypersync",
+    "trading",
+    "copy-trading",
+    "defi",
+    "ethereum"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@envio-dev/hypersync-client": "^0.6.3",
+    "blessed": "^0.1.81",
+    "blessed-contrib": "^4.11.0",
+    "chalk": "^5.4.1",
+    "dotenv": "^16.6.1",
+    "figlet": "^1.8.0",
+    "viem": "^2.9.6"
+  },
+  "type": "module"
+}
